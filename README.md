@@ -29,10 +29,35 @@
 ### Docker Compose（推荐）
 
 ```bash
-docker compose up --build        # 前台运行；加 -d 后台运行
+# 一键构建并等待健康检查通过后返回（冷启动通常数秒内即 healthy）
+docker compose up --build -d --wait
+
+# 或前台运行（Ctrl-C 停止）：docker compose up --build
+# 保留数据卷重启（停止后再起，任务/模板/配额/录分/批次全部保留）：
+docker compose down && docker compose up --build -d --wait
+# 仅在确实要清空全部持久化数据时才加 -v：docker compose down -v
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events、paper_scores、score_batches 与 score_batch_items 表），无需任何手动初始化。
+> **本轮启动链变动（容器不再在入口安装依赖）**：此前镜像在容器入口
+> （`entrypoint.sh`）执行 `pip install`，冷启动时下载、安装 FastAPI/OR-Tools
+> 等依赖耗时远超 Compose 的 `--wait` 健康窗口，导致
+> `docker compose up --build --wait --wait-timeout 60` 在服务就绪前超时失败、
+> API 不可访问。现已改为：
+>
+> 1. **运行依赖在镜像构建阶段一次性备齐**——`Dockerfile` 中
+>    `pip install -r requirements.txt` 后紧跟关键包导入自检
+>    （`python -c "import fastapi, uvicorn, pydantic, ortools"`）。依赖安装或
+>    导入任一步失败，`docker build` 立即非零退出，**绝不会带病产出镜像**；
+> 2. **容器启动时直接使用镜像内依赖**——`entrypoint.sh` 不再执行 pip、不访问
+>    外网，只拉起 uvicorn，冷启动秒级通过 `/health`；
+> 3. **SQLite 初始化与未决任务接管仍在启动时自动完成**——建库/轻量迁移由
+>    FastAPI lifespan 中的 `database.init_db()` 执行（全新库与保留数据卷均
+>    幂等），持久卷中遗留的 `pending` 任务与心跳陈旧的 `running` 孤儿任务由
+>    lifespan 中的 `startup_recover()` 立即接管（之后守护线程周期重扫）；
+> 4. Compose healthcheck 增加 `start_period: 10s`、收紧为每 5s 探测一次，
+>    `--wait --wait-timeout 60` 在冷启动与保留卷重启两种场景下都稳定通过。
+
+服务首次启动时自动创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events、paper_scores、score_batches 与 score_batch_items 表），无需任何手动初始化；对旧版本数据库会幂等补齐缺失列与索引。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
@@ -42,8 +67,45 @@ docker compose up --build        # 前台运行；加 -d 后台运行
   - `EXAM_TASK_SWEEP_SECONDS`：后台未决任务接管扫描周期（秒，默认 `10`）：服务启动时总会额外立即扫描一轮
 - 容器重启或服务重新部署后，上一进程遗留的未决任务（`pending` 及心跳陈旧的 `running`）会在启动时**自动接管恢复**，无需人工干预；也可随时调用 `POST /api/tasks/recover` 手动触发，详见[崩溃恢复与任务接管](#崩溃恢复与任务接管post-apitasksrecover)
 - 交互式文档（Swagger）：http://localhost:8000/docs
-- 健康检查：`curl http://localhost:8000/health`（Compose 已配置同路径 healthcheck）
+- 健康检查：`curl http://localhost:8000/health`（Compose 已配置同路径 healthcheck，`--wait` 即等待它变 healthy）
 - 查看日志：`docker compose logs -f exam-api`；停止：`docker compose down`
+
+#### 一键启动后的最小自检与调用示例
+
+```bash
+# 1) 健康检查（Compose --wait 通过的同一端点）
+curl -fsS http://localhost:8000/health
+# -> {"status":"ok"}
+
+# 2) 提交一个最小组卷任务
+TID=$(curl -fsS -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" -d '{
+    "name": "冒烟组卷",
+    "questions": [
+      {"id": 1, "score": 5,  "type": "single_choice", "difficulty": 0.2, "knowledge_points": ["集合"]},
+      {"id": 2, "score": 5,  "type": "single_choice", "difficulty": 0.5, "knowledge_points": ["函数"]},
+      {"id": 3, "score": 5,  "type": "single_choice", "difficulty": 0.8, "knowledge_points": ["导数"]},
+      {"id": 4, "score": 10, "type": "essay",         "difficulty": 0.6, "knowledge_points": ["函数", "导数"]},
+      {"id": 5, "score": 10, "type": "essay",         "difficulty": 0.7, "knowledge_points": ["数列"]}
+    ],
+    "total_score": 20,
+    "type_counts": {"single_choice": 2, "essay": 1},
+    "difficulty_range": [0.3, 0.7],
+    "target_difficulty": 0.5,
+    "seed": 42
+  }' | python3 -c "import sys,json;print(json.load(sys.stdin)['task_id'])")
+echo "task_id=$TID"   # -> task_id=1
+
+# 3) 轮询直到 done（冷启动后首个任务通常 1~3 秒完成）
+curl -fsS http://localhost:8000/api/tasks/$TID
+# -> {"task_id":1,"status":"done","result":{"status":"feasible",
+#     "selected_ids":[1,2,5], ...}}
+
+# 4) 保留数据卷重启后，上一任务仍在、结果不变；未决任务会被自动接管
+docker compose restart exam-api
+curl -fsS http://localhost:8000/api/tasks/$TID     # 仍为 done / feasible
+curl -fsS -X POST http://localhost:8000/api/tasks/recover   # 无未决任务时 {"claimed":[], ...}
+```
 
 ### 本地开发（不用 Docker）
 

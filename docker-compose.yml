@@ -11,10 +11,13 @@ services:
       - exam_data:/data
     restart: unless-stopped
     healthcheck:
+      # 依赖已内置镜像，uvicorn 冷启动通常 2~3 秒即可应答；start_period 内的
+      # 探测失败不计入 retries，避免冷启动抖动被误判 unhealthy
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+      start_period: 10s
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   exam_data:
