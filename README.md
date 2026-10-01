@@ -29,10 +29,36 @@
 ### Docker Compose（推荐）
 
 ```bash
-docker compose up --build        # 前台运行；加 -d 后台运行
+# 一键构建并启动；--wait 阻塞到 /health 健康检查通过（或 --wait-timeout 超时）
+docker compose up --build -d --wait
+
+# 前台运行（不加 -d）；只构建不启动可用：docker compose build
+docker compose up --build
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events、paper_scores、score_batches 与 score_batch_items 表），无需任何手动初始化。
+> **本轮启动链变更：运行依赖在镜像构建阶段装齐，容器启动时不再联网安装。**
+> 旧版在容器入口（`entrypoint.sh`）里执行 `pip install`，冷启动需现场下载
+> OR-Tools 等较大依赖，进程迟迟不监听端口，`docker compose up --build --wait`
+> 常在健康检查超时后判定服务未就绪。现改为：
+>
+> 1. **构建期安装（失败即构建失败）**：`Dockerfile` 在 `RUN pip install -r
+>    requirements.txt` 层装齐 FastAPI / uvicorn / pydantic / OR-Tools，并在随后
+>    两层做依赖导入与 `import app.main`、字节码编译的冒烟校验——依赖无法解析、
+>    下载失败或应用自身导入错误都会以非零退出**明确中断 `docker build`**，绝不
+>    带入运行时；
+> 2. **启动期零安装**：容器入口只对持久卷上的 SQLite 做**幂等初始化/轻量迁移**
+>    （全新卷建库、旧卷自动补齐列与索引），随后直接 `exec uvicorn` 使用镜像内
+>    依赖，冷启动通常数秒内通过 `/health`；
+> 3. **未决任务随启动接管**：API lifespan 启动时立即接管上一进程遗留任务
+>    （`pending` 立即领取、心跳为空/陈旧的 `running` 抢占重跑，`done` 永不重算），
+>    守护线程之后每 `EXAM_TASK_SWEEP_SECONDS` 周期重扫；因此**冷启动与保留数据卷
+>    后的重启**都会先完成库初始化与任务接管再对外服务，健康检查统一走
+>    `/health`（Compose healthcheck 增加了 `start_period` 宽限，探测更密）。
+>
+> 数据库表（tasks、templates、quotas、quota_reservations、quota_leases、
+> task_audit_events、paper_scores、score_batches 与 score_batch_items）由
+> `init_db()` 以 `CREATE TABLE IF NOT EXISTS` 幂等创建，挂旧卷重启无需任何手动
+> 迁移或初始化；全部业务接口的请求/响应结构保持不变。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
@@ -42,8 +68,22 @@ docker compose up --build        # 前台运行；加 -d 后台运行
   - `EXAM_TASK_SWEEP_SECONDS`：后台未决任务接管扫描周期（秒，默认 `10`）：服务启动时总会额外立即扫描一轮
 - 容器重启或服务重新部署后，上一进程遗留的未决任务（`pending` 及心跳陈旧的 `running`）会在启动时**自动接管恢复**，无需人工干预；也可随时调用 `POST /api/tasks/recover` 手动触发，详见[崩溃恢复与任务接管](#崩溃恢复与任务接管post-apitasksrecover)
 - 交互式文档（Swagger）：http://localhost:8000/docs
-- 健康检查：`curl http://localhost:8000/health`（Compose 已配置同路径 healthcheck）
+- 健康检查：`curl http://localhost:8000/health`（Compose 已配置同路径 healthcheck：`interval=5s`、`timeout=3s`、`retries=10`、`start_period=30s`）
 - 查看日志：`docker compose logs -f exam-api`；停止：`docker compose down`
+- 验证健康状态：`docker compose ps`（启动后 `STATUS` 列显示 `healthy`）
+
+### 冷启动与保留数据卷重启
+
+```bash
+# 冷启动（无卷）：构建期装依赖 -> 启动期建库 -> 数秒内 healthy
+docker compose up --build -d --wait
+curl http://localhost:8000/health          # -> {"status":"ok"}
+
+# 保留数据卷的重启/重建（不使用 -v）：旧库直接挂载，幂等迁移后接管未决任务
+docker compose restart exam-api            # 或：docker compose up --build -d --wait
+docker compose logs exam-api | grep recovered   # 可见 [startup] recovered unfinished tasks: [...]
+```
+
 
 ### 本地开发（不用 Docker）
 
